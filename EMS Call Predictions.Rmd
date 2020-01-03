@@ -1,0 +1,580 @@
+---
+title: "MUSA 507 Final Project: EMS Call Location Predictions and the Responder App"
+author: "Anthony Ayebiahwe & Steven Chang"
+date: "December 11, 2018"
+output: html_document
+---
+
+<center> <h3> INTRODUCTION </h3> </center>
+Nobody wants to run into an emergency, call for an ambulance, then having to wait forever for help to arrive. In fact, in the last year, over 20% of all emergency medical service calls in San Rafael, California was delayed. This can often have serious consequences for the victims, especially for those facing medical emergencies such as seizures or cardiac arrests. This raises an important ethical policy question: Can we predict the locations of EMS calls so that ambulances and EMS responders can be strategically positioned close to where help may be needed, such that when an emergency occurs, response times may be shortened? Shorter response times often mean better chances of survival for victims with medical emergencies like heart attacks and seizures, and less pain and discomfort for those with non life-threatening conditions who need medical help, such as those whose suffered traumatic fall injuries. 
+
+To address this issue, we built a model that attempts to predict the locations of EMS calls in Marin County. We also seeked to integrate this information into a mobile application that runs on handheld devices that EMS responders will carry. The app will display a map of the county, complete with color-coded risk levels for different areas. It will also suggest suitable standby locations in predicted high-risk areas so responders can post in those areas before an emergency occurs. A simplified use case of our algorithm involves mining call location data from all EMS calls, feeding that into the predictive model to analyze areas that tend to generate the most calls, and having the model predict high and higher-risk hotspot areas that may continue to generate more calls. These will be areas that EMS responders may post at to respond quicker should an emergency is to occur.
+
+The current decision-making process for ambulance dispatch takes several steps. When a 911 call is placed, it is routed to the dispatcher, who then uses the caller's descriptions to gauge the severity of the incident and decide on which units and resources should be sent to the caller's location. The dispatcher then contacts the teams with the necessary resources to respond, and if more resources are needed than are available, additional units may need to be brought in from nearby municipalities. The large number of intermediary communications and potential lack of appropriate resources are major contributors to delayed responses, and in true emergencies, this may pose life-or-death situations for the victims. Our algorithm may help with this situation by having EMS responders post in areas that are more likely to generate an EMS call, allowing for more rapid responses. The outcomes of interest will be faster response times, less stress scrambling resources together to respond to an incident, and maximizing the use of limited resources through optimizing allocation. Collectively, by taking a more proactive approach, we hope to create a safer community, making citizens happier and the lives of EMS responders more manageable.
+
+This document will provide an overview of our model, including data gathering, cleaning, wrangling, exploratory analysis, model-building, output results, and model validation.
+
+
+```{r include=FALSE}
+# Loading libraries
+library(tidyverse)
+library(sf)
+library(QuantPsyc)
+library(RSocrata)
+library(viridis)
+library(FNN)
+library(lubridate)
+library(knitr)
+library(tidycensus)
+library(ggmap)
+library(maptools)
+library(sp)
+library(spatstat)
+library(rgdal)
+library(raster)
+library(rasterVis)
+library(grid)
+library(gridExtra)
+library(RColorBrewer)
+library(stargazer)
+require(ggplot2)
+library(rgeos)
+library(kableExtra)
+library(caret)
+library(MASS)
+library(pscl)
+library(glmnet)
+require(Metrics)
+library(corrplot)
+library(QuantPsyc)
+library(scales)
+library(spdep)
+require(Ckmeans.1d.dp)
+require(gbm)
+library(GGally)
+library(data.table)
+  
+setwd("~/Library/Mobile Documents/com~apple~CloudDocs/School/UPenn/MUSA 507/Final Project/Eureka/Final_Net")
+```
+
+
+<center> <h3> Data Gathering, Cleaning, and Wrangling </h3> </center>
+
+<h5> Setting Map Theme and Color Palettes </h5>
+```{r warning=FALSE}
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2)
+  )
+}
+
+
+ palette10 <- c("#FFFFFF", "#FFFFCC", "#FFEDA0", "#FED976", "#FEB24C", "#FD8D3C", "#FC4E2A",   "#E31A1C", "#BD0026", "#800026")
+  palette10_inverse <- c("#800026", "#BD0026", "#E31A1C", "#FC4E2A", "#FD8D3C", "#FEB24C",   "#FED976", "#FFEDA0", "#FFFFCC", "#FFFFFF")
+```
+
+
+<h5> Dependent Variable - EMS Calls </h5>
+We first downloaded a dataset of all EMS calls, along with detailed information about each call, for Marin County, California from the county's open data website. We selected only those attributes for each call that we will use for our analysis, removed 31 observations where there are NA values in those attributes, and wrote the data into a new CSV file.
+```{r}
+#Downloading the Data and Cleaning to remove NA's
+Emergency1<-read_sf("https://data.marincounty.org/resource/7bzr-ymkc.geojson")
+Emergency2<-subset(Emergency1,select=c(latitude,longitude, geometry,incident_number,time_call_was_received))
+
+# Data cleaning and writing the resulting data frame to csv
+result1 <- data.table(Emergency2)[, lapply(.SD, function(x) x[order(is.na(x))])]
+results2<-as.data.frame(result1[!result1[, Reduce(`&`, lapply(.SD, is.na))]])
+results3<-na.omit(results2)
+results3<-subset(results3,select = -geometry)
+best<-write.csv(results3,"emergencyuse.csv")
+```
+
+We converted the previous CSV file into a GeoJSON to read in, and added a boundary shapefile for Marin County. We then created a fishnet and joined the call locations to the fishnet by intersecting each call's latitude and longitude coordinates with the net. This is followed by the "crossing" function that allows us to get unique fishnet cell ID's that will contain the number of calls in each individual cell. Finally, we created an Emergency_net to be used in the final fishnet.
+```{r message=FALSE, warning=FALSE}
+# Getting the boundary shapefile and reading the Geojason file of the emergency calls
+boundary <- read_sf("https://data.marincounty.org/api/geospatial/3dg6-if6x?method=export&format=GeoJSON")
+boundary <- st_transform(st_union(boundary), crs=4269)
+Emergency<-read_sf("emergencyuse.geojson")
+Emergency<-read_sf("emergencyuse.geojson") %>%
+  mutate(dateTime = ymd_hms(Emergency$time_call_was_received),
+         year=year(dateTime),
+         day=wday(dateTime)) %>%
+  dplyr::select(latitude,longitude, Y = latitude, X = longitude) %>%
+  #project
+  st_transform(102285) %>%
+  dplyr::select() 
+
+#create fishnet
+fishnet <- 
+  st_make_grid(st_transform(boundary,102285), cellsize = 3000) %>%
+  st_intersection(st_transform(boundary,102285), .) %>%
+  st_sf() %>%
+  mutate(fishnetID = rownames(.)) %>%
+  dplyr::select(fishnetID)
+
+#Now add fishnet geometries to these points by intersecting the emergency points
+#with the fishnet
+pnt_join <- st_intersection(x = fishnet, y = Emergency) %>%
+  group_by(fishnetID) %>%
+  na.omit()%>%
+  summarise(count = n())
+
+#Now we're going to using `crossing` to create a data frame with a unique number of 
+#fishnet IDs. This will ensure we get no empty fishnet IDs. We then join this back to 
+#the fishnet to get the fishnet geometry with the count 
+#field.
+results <- tidyr::crossing(fishnetID = unique(fishnet$fishnetID)) %>%
+  left_join(., fishnet, by="fishnetID") %>%
+  left_join(., pnt_join, by=c("fishnetID")) %>%
+  mutate(count= ifelse(is.na(count),0,count)) %>%
+  na.omit()%>%
+  rename("geometry" = geometry.x) %>%
+  dplyr::select(-geometry.y) %>%
+  st_sf()
+
+# Making Emergency_net to be used in the final Fishnet
+Emergency<-read_sf("emergencyuse.geojson")
+Emergency.sf <-
+  Emergency%>%
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet))
+
+Emergency_net <- 
+  Emergency.sf %>% 
+  dplyr::select() %>% 
+  mutate(countTime = 1) %>% 
+  aggregate(., fishnet, length) %>%
+  mutate(countTime = ifelse(is.na(countTime), 0, countTime),
+         fishnetID = rownames(.))
+
+```
+
+<h5> Independent Variables </h5>
+For our independent variables, we gathered the locations of all schools, medical facilities, public libraries, nursing homes, law enforcement, and fire stations within Marin County. The data came in shapefiles, and their coordinates are calculated in ArcGIS, exported, and converted to GeoJSON to be read in.
+```{r}
+schools<-read_sf("Schools.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "schools")
+
+MedicalFacilities<-
+  read_sf("Medical_Facilities.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "MedicalFacilities")
+
+Libraries<-
+  read_sf("Libraries.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Libraries")
+
+Nursing_Homes<-
+  read_sf("Nursing_Homes.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "NursingHomes")
+
+Law_Enforcement<-
+  read_sf("Law_Enforcement.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "LawEnforcement")
+
+Fire_Stations<-
+  read_sf("Fire_Stations.geojson")%>%
+dplyr::select(Latitude,Longitude, Y = Latitude, X = Longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs =4269, agr = "constant") %>%
+  st_sf() %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "FireStations")
+```
+
+<h5> Wrangling Independent Variables To the Fishnet </h5>
+
+Next, we wrangled the independent variables into one dataset. The code block below performs an rbind on the 6 shapefiles we created above, mutates new X and Y coordinate fields, and creates a data frame.
+```{r}
+ allVars <- 
+  rbind(schools,Libraries,MedicalFacilities,Nursing_Homes,Law_Enforcement,Fire_Stations) %>%
+    mutate(X = st_coordinates(.)[,1],
+           Y = st_coordinates(.)[,2]) %>%
+    as.data.frame()
+```
+
+Then, we joined each set of points to our fishnet. The goal is to get a new shapefile with count fields for each of our 6 independent variables. To do this, we rbind the 6 shapefiles together into allVars.sf. The idea is to spatially join all 6 point shapefiles to the fishnet, count the number of points by variable (ie. Legend), then spread the data to wide form so we end up with rows of fishnet grid cells and columns of count for each feature. The output is vars_net. It is in wide form as that is what we need for a regression. We also removed the <NA> column that was generated.
+```{r}
+allVars.sf <- 
+  rbind(Libraries,schools,MedicalFacilities,Nursing_Homes,Law_Enforcement,Fire_Stations) 
+  
+vars_net1 <- 
+  st_join(allVars.sf, fishnet, join=st_within) %>%
+  as.data.frame() %>%
+  group_by(fishnetID,Legend) %>%
+  summarize(count = n()) %>%
+  full_join(fishnet) %>%
+  spread(Legend,count, fill=0) %>%
+  st_sf() %>%
+  na.omit()
+
+vars_net1
+
+# Remove the <NA> column in the vars_net1 to create a vars_net dataframe
+cols.dont.want <- "<NA>"
+
+vars_net <- vars_net1[, ! names(vars_net1) %in% cols.dont.want, drop = F]
+```
+
+<center> <h3> Exploratory Analysis </h3> </center>
+We first plotted the number of calls in each fishnet cell within Marin County to get an overview of where EMS calls are generally coming in from. Results show that calls tend to be clustered in the southeastern portion of the county. This is as expected as this area contains the county's major urban areas, while the western parts of the county are mostly rural and features a large national seashore and a few sparsely populated towns.
+```{r}
+#plotting number of calls in each fishnet cell across Marin County
+ggplot() +
+  geom_sf(data=results, aes(fill=count)) +
+  scale_fill_viridis()
+```
+
+We then looked at a few time series plots for the month of January 2017 by hour of day to see the distribution of calls across time. On all days of the week, there seems to be the greatest number of calls during the midday hours, mostly following the daytime activity hours of the county's residents.
+```{r}
+EM1<-read.socrata("https://data.marincounty.org/resource/7bzr-ymkc.json")
+```
+```{r}
+#get 2017 count of calls in January
+dat_17 <- 
+  EM1 %>%
+  mutate(dateTime = ymd_hms(EM1$time_call_was_received)) %>%
+  filter(year(dateTime) == "2017",
+         month(dateTime) == "1") 
+      
+
+#Group by ZipCode
+dat_17 %>%
+  group_by(incident_zip_postal) %>%
+  count()
+
+#How about a time series plot for the whole month by hour and day of the week including weekends.
+dat_17 %>%
+  mutate(dotw = wday(dateTime)) %>%
+  filter(dotw != "Sun" & dotw != "Sat") %>%
+  mutate(hour = hour(dateTime)) %>%
+  group_by(dotw,hour) %>%
+  count() %>%
+  ggplot(aes(hour,n)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~dotw)
+
+```
+
+Next, we looked at the distribution of our independent variables across the county. Here, we plotted the number of each type of facility within each fishnet grid cell across the county. Similar to the number of calls, these tend to be clustered in the southeastern part of the county, where the majority of the county's population resides.
+```{r}
+#Mapping each independent variable as a small multiple
+vars_net %>%
+gather(key,value,-geometry, -fishnetID) %>%
+mutate(value = ifelse(is.na(value),0,value)) %>%
+filter(key != "<NA>") %>%
+ggplot(data=.) +
+  geom_sf(aes(fill=value), colour=NA) +
+  facet_wrap(~key) +
+  mapTheme() +
+  scale_fill_viridis()
+```
+
+In this section, we defined a function that calculates the nearest neighbor distances from each of our independent variables facilities.
+```{r}
+#Function for calculating the nearest neighbor distance
+nn_function <- function(measureFrom,measureTo,k) {
+  
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+  
+  output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint)
+  
+  return(output)  
+}
+```
+
+<h5> Proximity to Schools and Effects on the Count of Emergency Calls </h5>
+We are especially interested in the relationships between proximity to schools and the number of EMS calls in that area. The social implications of this is the safety of our educational environments, and we would hope that areas around schools are not hotspots for EMS calls. We will feature-engineer this distance information to become one of the predictors in our model.
+```{r warning=FALSE}
+# Getting the schools data to be used for the distance calculation
+Schools<-read_sf("Schools.geojson")%>%
+   st_transform(st_crs(fishnet))
+vars_net.xy <- 
+  st_centroid(vars_net) %>%
+  cbind(.,st_coordinates(st_centroid(vars_net))) %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+
+Schools.xy <- 
+  Schools %>%
+  cbind(.,st_coordinates(st_centroid(Schools)))  %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+```
+
+```{r}
+#use the function to measure average nearest neighbor distance with k=2 
+distSchools <- as.data.frame(nn_function(vars_net.xy,Schools.xy,2)) 
+
+vars_net <- 
+  cbind(as.data.frame(vars_net),distSchools) %>%
+  st_sf() %>%
+  rename(schoolsDistance=pointDistance)
+
+ggplot() +
+  geom_sf(data=vars_net,aes(fill=schoolsDistance)) +
+  geom_point(data=data.frame(Schools.xy), aes(X,Y)) +
+  scale_fill_viridis() +
+  mapTheme() +
+  labs(title="Average nearest neighbor distance to schools",
+       subtitle="k=2 ")
+```
+
+<h5> Proximities to Other Facilities and Effects on the Count of Emergency Calls </h5>
+We also calculated the average nearest neighbor distances to nursing homes and medical facilities. Although they will not be plotted here, this feature-engineered distance information will serve as other predictors for our model. We hypothesized that the elderly and more vulnerable populations may tend to cluster around nursing homes and medical facilities, which may give rise to higher likelihoods that an EMS call may be generated here.
+```{r warning=FALSE}
+# Getting the Nursing Homes data to be used for the distance calculation
+NursingHomes1<-read_sf("Nursing_Homes.geojson")%>%
+   st_transform(st_crs(fishnet))
+#use the function to measure average nearest neighbor distance with k=2
+vars_net.xy <- 
+  st_centroid(vars_net) %>%
+  cbind(.,st_coordinates(st_centroid(vars_net))) %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+
+NursingHomes.xy <- 
+  Nursing_Homes%>%
+  cbind(.,st_coordinates(st_centroid(Nursing_Homes)))  %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+
+#use the function to measure average nearest neighbor distance with k=2 
+distNursingHomes <- as.data.frame(nn_function(vars_net.xy,NursingHomes.xy,2)) 
+
+vars_net <- 
+  cbind(as.data.frame(vars_net),distNursingHomes) %>%
+  st_sf() %>%
+  rename(NursingHomesDistance=pointDistance)
+
+# Getting the Medical Facilities data to be used for the distance calculation
+Medfacilities1<-read_sf("Medical_Facilities.geojson")%>%
+  st_transform(st_crs(fishnet))
+
+#use the function to measure average nearest neighbor distance with k=2
+vars_net.xy <- 
+  st_centroid(vars_net) %>%
+  cbind(.,st_coordinates(st_centroid(vars_net))) %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+
+Medicalfaclities.xy <- 
+  MedicalFacilities%>%
+  cbind(.,st_coordinates(st_centroid(MedicalFacilities)))  %>%
+  st_set_geometry(NULL) %>%
+  dplyr::select(X,Y) %>%
+  as.matrix()
+
+#use the function to measure average nearest neighbor distance with k=2 
+distMedicalFacilities <- as.data.frame(nn_function(vars_net.xy,Medicalfaclities.xy,2)) 
+
+vars_net <- 
+  cbind(as.data.frame(vars_net),distMedicalFacilities) %>%
+  st_sf() %>%
+  rename(MedicalFacilitiesDistance=pointDistance)
+```
+
+<h5> Creating the Final Fishnet </h5>
+Finally, we join all of the above information, including facilities point locations and average nearest neighbor distances, into our final fishnet to conduct our predictive modeling.
+```{r}
+final_net <-
+  left_join(Emergency_net,data.frame(vars_net), by="fishnetID") %>%
+  dplyr::select(-geometry)
+  
+head(final_net)
+```
+
+<center> <h3> MODELING </h3> </center>
+The extensive data wrangling, feature-engineering, and exploratory analysis processes informed the creation of a poisson regression model to predict the risk of emergency calls across Marin County. The following section will outline the process of model building, validation, and the conversion of predictions into actionable intelligence.
+
+<h5> The Model </h5>
+Since the emergency call count across the fishnet is non-linear, represents a rare event, and does not follow a normal distribution, we used a Poisson regression model, or the "generalized linear model". Here, we modeled the call count as the dependent variable with Poisson regression. The regression results show that all of our predictors, with the exception of the locations of schools, are statistically significantly related to the EMS call count. Of those, distances to medical facilities and schools, and locations of fire stations and nursing homes are highly statistically significant.
+```{r}
+# Initial Poisson Regression Model
+reg <- glm(countTime ~ ., family = "poisson", 
+           data= final_net %>% 
+             as.data.frame %>% 
+             dplyr::select(countTime, 
+                           MedicalFacilitiesDistance,
+                           FireStations,
+                           LawEnforcement,
+                           NursingHomes,
+                           schools,
+                           schoolsDistance,
+                           Libraries
+                           
+                           
+                            ))
+stargazer(reg, type="text", title = "Summary Statistics")
+```
+
+<h5> Standardized Coefficients and Variable Importance </h5>
+We then standardized our regression coefficients to place all the estimates in the same scale. This can provide us with a better understanding of which independent variables play more significant roles in predicting emergency calls.
+```{r}
+standardized <- as.data.frame(lm.beta(reg))
+standardized$variable <- row.names(standardized)
+colnames(standardized)[1] <- "std_coefficient"
+standardized
+```
+
+We purposefully included variables with multiple feature engineered forms (distance, density, and nearest neighbor) to find out whether the distance of the variable or the variable itself is important in the machine learning process. The final model will be honed to only include features that were demonstrated to be important in the machine learning process. Here, we plotted the above standardized coefficient information to provide a visualization of the importance of each variable in predicting EMS calls. According to the plot, distance to schools seem to be playing the most significant role in predicting EMS calls, followed by distance to medical facilities. The locations of law enforcement and schools play the least significant roles in predicting EMS calls.
+```{r fig.height=7, fig.width=12}
+#Visualizing the standardized variables in ggplot
+standardized$absCoef <- abs(standardized$std_coefficient)
+
+ggplot(standardized, aes(x=reorder(variable,-absCoef), y=absCoef, fill=variable)) + 
+  geom_bar(stat="identity")
+```
+
+<h5> Mapping Predictions </h5>
+The fitted values of our predictions show that cells with the highest risks have an expected rate of emergency calls that is approximately 90 times higher than a cell with a value of 1.0. This number does not seem to be excessively high even though we included a handful of variables. Hence, we do not have a very bad model.
+```{r}
+# Finding the Range of Fitted Values
+range(reg$fitted.values)
+
+#Plotting the Predicted Emergency Counts
+ggplot() +
+  geom_sf(data=cbind(fishnet,reg$fitted.values), aes(fill=reg.fitted.values), colour=NA) +
+  labs(title= "Predicted Emergency Call risk") +
+  scale_fill_viridis() +
+  mapTheme()
+```
+
+<h5> Assessing Goodness of Fit </h5>
+We calculated Mean Absolute Error to assess the goodness of fit for the model since we have a count data. Our model has an MAE of roughly 2.3. This performance is acceptable, though there is certainly room for improvement.
+```{r}
+cbind(final_net,reg$fitted.values) %>%
+mutate(error = abs(countTime - reg.fitted.values)) %>%
+st_set_geometry(NULL) %>%
+summarize(MAE = mean(error))
+```
+
+<h5> Model Validation - Splitting, Training, and Testing </h5>
+Building a model that achieves the strongest fit for any use case involves extensive testing of different combinations of variables and model types. With this final model, we split our existing data into a training and a test set, built a poisson regression model, and evaluated the strength of variables in each model so that we can use the model to predict on the full dataset. Afterwards, we applied model validation metrics to evaluate the strength of the model by calculating mean absolute error for the model and creating a histogram of residuals. We split our data into a 60% training set and a 40% test set. After training the model, we predicted on the test set. Notice that we have dropped the locations of schools as our predictor variables as an earlier analysis shows that this variable is neither statistically significant nor does it play a meaningful role in predicting for EMS calls.
+```{r}
+# 60 / 40 split for testing regressions
+  set.seed(777)  #set a random seed to allow for duplication of results
+  partition <- createDataPartition(final_net$countTime, p = 0.6, list = FALSE) #create a partition
+  fishnetTrain <- final_net[partition, ] #Training set is this partition of the fishnet (60%)
+  fishnetTest <- final_net[-partition, ] #Test set is the remaining portion of the fishnet data (40%)
+
+#training the model
+  pFit <- glm(fishnetTrain$countTime~ MedicalFacilitiesDistance+schoolsDistance+
+  FireStations+NursingHomes+Libraries+LawEnforcement,
+                 family = "poisson", data = fishnetTrain)
+                           
+  
+  #generating predictions
+  fishnetTest$pred.pFit <- predict.glm(pFit, as.data.frame(fishnetTest), type = "response")
+```
+
+As with the previous regression, we created a visualization of the standardized coefficients of this new regression. Distance to schools and distance to medical facilities remain significant players in the prediction of EMS calls.
+```{r fig.height=7, fig.width=12}
+
+  standardized <- as.data.frame(lm.beta(pFit))
+  standardized$variable <- row.names(standardized)
+  colnames(standardized)[1] <- "std_coefficient"
+  standardized$absCoef <- abs(standardized$std_coefficient)
+  
+  ggplot(standardized, aes(x=reorder(variable,-absCoef), y=absCoef, fill=variable)) + 
+    geom_bar(stat="identity", color="black", size = 0.75) 
+```
+
+<h5> Generating Prediction Maps </h5>
+Here, we created a prediction map of the risk levels for each fishnet cell in generating an EMS call. Higher risk areas are clustered in the eastern and southeastern parts of the county, while areas in the west are generally lower risk areas, with the exception of a small area in the far north of the county. This is the sort of information that may get displayed in the Responder mobile application interface, which shows the whole county and the associated risk levels at a glance. The standby location prediction will use this information to make recommendations of strategic posting locations to EMS responders to shorten response times should an emergency occurs.
+```{r}
+  #predict on the full data set
+    pred.pFit <- predict.glm(pFit, as.data.frame(final_net), type = "response")
+    
+  #mapping the predictions
+    ggplot() + 
+      geom_sf(data = final_net, aes(fill = factor(ntile(pred.pFit, 10))), color = NA) + 
+      scale_fill_manual(values = palette10,
+                        name="Predictions \n(Decile Breaks)", 
+                        labels = c("Low", "", "", "", "", "", "", "", "", "High")) +
+      geom_sf(data = boundary, aes(), fill = NA, color = "grey40", size = 0.5) +
+      labs(title="Map of Predictions") +
+      mapTheme()
+```
+
+<h5> Model Validation Metrics </h5>
+We ran predictions on our test set, then obtained a mean absolute error of roughly 2.7.
+```{r}
+#Predicting on the Test Set
+    pred.pFit <- predict.glm(pFit, as.data.frame(fishnetTest), type = "response")
+  
+#Calculating the Mean Absolute Error
+    #take the absolute value of the actual count minus the predicted count
+   absError.pFit <- abs(fishnetTest$countTime - pred.pFit) 
+    #take the mean of this value
+    mean(absError.pFit) 
+```
+
+Finally, we created a visualization of the distribution of the regression residuals.
+```{r}
+#Visualizing the distribution of residuals
+    ggplot(fishnetTest, aes(absError.pFit)) +
+      geom_histogram(bins = 20, fill = "#006d2c", color = "black", size = 0.75) +
+      labs (x = "Residuals",
+            y = "Count",
+            title = "Distribution of Residuals",
+            subtitle = "Mean Absolute Error is 2.69 count of Emergency Calls Events") 
+      
+```
+
+<center> <h3> DISCUSSION </h3> </center>
+Overall, our model and analysis are able to meet the use case that we initially set out to address. The model allowed us to predict the areas within Marin County that are at higher risks of generating EMS calls, and the output map can be implemented into the Responder mobile application to provide a clear visualization to EMS responders about which areas may need extra staffing to cover. However, the model itself isn't perfect, and there is certainly room for improvement. An MAE of 2.7 suggests that our model may be underfit. Additional features and data, such as population or household demographic and socioeconomic information at the census tract or block group levels could be implemented in the model to further increase its predictive power. Furthermore, due to time constraints, we were unable to implement a kernel density comparison with our predictions, which may provide useful insights on the evaluation of our model's performance. Nevertheless, our analysis and model serve as a good starting point for future algorithms to effectively predict EMS calls and improve response times.
+
+
+
